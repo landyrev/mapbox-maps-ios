@@ -1,12 +1,9 @@
-// swiftlint:disable file_length
 @_exported import MapboxCoreMaps
 @_exported import MapboxCommon
 @_implementationOnly import MapboxCoreMaps_Private
 @_implementationOnly import MapboxCommon_Private
 import UIKit
 import Turf
-
-internal typealias PendingAnimationCompletion = (completion: AnimationCompletion, animatingPosition: UIViewAnimatingPosition)
 
 open class MapView: UIView {
 
@@ -73,24 +70,15 @@ open class MapView: UIView {
     /// The underlying metal view that is used to render the map
     internal private(set) var metalView: MTKView?
 
+    private let cameraViewContainerView = UIView()
+
     /// Resource options for this map view
     internal private(set) var resourceOptions: ResourceOptions!
-
-    /// List of completion blocks that need to be completed by the displayLink
-    internal var pendingAnimatorCompletionBlocks: [PendingAnimationCompletion] = []
-
-    /// Pointer HashTable for holding camera animators
-    private var cameraAnimatorsSet = WeakSet<CameraAnimatorInterface>()
-
-    /// List of animators currently alive
-    internal var cameraAnimators: [CameraAnimator] {
-        return cameraAnimatorsSet.allObjects
-    }
 
     private var needsDisplayRefresh: Bool = false
     private var dormant: Bool = false
     private var displayCallback: (() -> Void)?
-    @objc dynamic internal var displayLink: CADisplayLink?
+    private var displayLink: DisplayLinkProtocol?
 
     /// Holding onto this value that comes from `MapOptions` since there is a race condition between
     /// getting a `MetalView`, and intializing a `MapView`
@@ -102,11 +90,23 @@ open class MapView: UIView {
     /// a nib.
     @IBOutlet internal private(set) weak var mapInitOptionsProvider: MapInitOptionsProvider?
 
+    private let dependencyProvider: MapViewDependencyProviderProtocol
+
     /// The preferred frames per second used for map rendering
     public var preferredFramesPerSecond: PreferredFPS = .maximum {
         didSet {
             updateDisplayLinkPreferredFramesPerSecond()
         }
+    }
+
+    /// The `timestamp` from the underlying `CADisplayLink` if it exists, otherwise `nil`
+    @_spi(Metrics) public var displayLinkTimestamp: CFTimeInterval? {
+        return displayLink?.timestamp
+    }
+
+    /// The `duration` from the underlying `CADisplayLink` if it exists, otherwise `nil`
+    @_spi(Metrics) public var displayLinkDuration: CFTimeInterval? {
+        return displayLink?.duration
     }
 
     /// The map's current camera
@@ -116,10 +116,7 @@ open class MapView: UIView {
 
     /// The map's current anchor, calculated after applying padding (if it exists)
     public var anchor: CGPoint {
-        let padding = cameraState.padding
-        let xAfterPadding = center.x + padding.left - padding.right
-        let yAfterPadding = center.y + padding.top - padding.bottom
-        return CGPoint(x: xAfterPadding, y: yAfterPadding)
+        return mapboxMap.anchor
     }
 
     deinit {
@@ -132,8 +129,29 @@ open class MapView: UIView {
     ///   - mapInitOptions: `MapInitOptions`; default uses
     ///    `ResourceOptionsManager.default` to retrieve a shared default resource option, including the access token.
     public init(frame: CGRect, mapInitOptions: MapInitOptions = MapInitOptions()) {
+        dependencyProvider = MapViewDependencyProvider()
         super.init(frame: frame)
         commonInit(mapInitOptions: mapInitOptions, overridingStyleURI: nil)
+    }
+
+    required public init?(coder: NSCoder) {
+        dependencyProvider = MapViewDependencyProvider()
+        super.init(coder: coder)
+    }
+
+    internal init(frame: CGRect,
+                  mapInitOptions: MapInitOptions,
+                  dependencyProvider: MapViewDependencyProviderProtocol) {
+        self.dependencyProvider = dependencyProvider
+        super.init(frame: frame)
+        commonInit(mapInitOptions: mapInitOptions, overridingStyleURI: nil)
+    }
+
+    /// :nodoc:
+    /// See https://developer.apple.com/forums/thread/650054 for context
+    @available(*, unavailable)
+    internal override init(frame: CGRect) {
+        fatalError("This initializer should not be called.")
     }
 
     private func commonInit(mapInitOptions: MapInitOptions, overridingStyleURI: URL?) {
@@ -190,6 +208,9 @@ open class MapView: UIView {
             mapboxMap.setCamera(to: cameraOptions)
         }
 
+        cameraViewContainerView.isHidden = true
+        addSubview(cameraViewContainerView)
+
         // Setup Telemetry logging
         setUpTelemetryLogging()
 
@@ -200,10 +221,12 @@ open class MapView: UIView {
     internal func setupManagers() {
 
         // Initialize/Configure camera manager first since Gestures needs it as dependency
-        camera = CameraAnimationsManager(mapView: self)
+        camera = CameraAnimationsManager(
+            cameraViewContainerView: cameraViewContainerView,
+            mapboxMap: mapboxMap)
 
         // Initialize/Configure gesture manager
-        gestures = GestureManager(for: self, cameraManager: camera)
+        gestures = GestureManager(view: self, cameraAnimationsManager: camera, mapboxMap: mapboxMap)
 
         // Initialize/Configure ornaments manager
         ornaments = OrnamentsManager(view: self, options: OrnamentOptions())
@@ -258,50 +281,30 @@ open class MapView: UIView {
         mapboxMap.size = bounds.size
     }
 
-    func validateDisplayLink() {
-        if superview != nil
-            && window != nil
-            && displayLink == nil {
-            let target = BaseMapViewProxy(mapView: self)
-            displayLink = window?.screen.displayLink(withTarget: target, selector: #selector(target.updateFromDisplayLink))
-
+    private func validateDisplayLink() {
+        if let window = window, displayLink == nil {
+            displayLink = dependencyProvider.makeDisplayLink(
+                window: window,
+                target: ForwardingDisplayLinkTarget { [weak self] in
+                    self?.updateFromDisplayLink(displayLink: $0)
+                },
+                selector: #selector(ForwardingDisplayLinkTarget.update(with:)))
             updateDisplayLinkPreferredFramesPerSecond()
             displayLink?.add(to: .current, forMode: .common)
-
         }
     }
 
-    @objc func updateFromDisplayLink(displayLink: CADisplayLink) {
+    private func updateFromDisplayLink(displayLink: CADisplayLink) {
         if window == nil {
             return
         }
 
-        if needsDisplayRefresh
-            || cameraAnimatorsSet.allObjects.count > 0
-            || !pendingAnimatorCompletionBlocks.isEmpty {
+        camera.update()
+
+        if needsDisplayRefresh {
             needsDisplayRefresh = false
-
-            for animator in cameraAnimatorsSet.allObjects {
-                if let cameraOptions = animator.currentCameraOptions {
-                    mapboxMap.setCamera(to: cameraOptions)
-                }
-            }
-
-            /// This executes the series of scheduled animation completion blocks and also removes them from the list
-            while !pendingAnimatorCompletionBlocks.isEmpty {
-                let pendingCompletion = pendingAnimatorCompletionBlocks.removeFirst()
-                let completion = pendingCompletion.completion
-                let animatingPosition = pendingCompletion.animatingPosition
-                completion(animatingPosition)
-            }
-
-            self.displayCallback?()
+            displayCallback?()
         }
-    }
-
-    // Add an animator to the `cameraAnimatorsSet`
-    internal func addCameraAnimator(_ cameraAnimator: CameraAnimatorInterface) {
-        cameraAnimatorsSet.add(cameraAnimator)
     }
 
     func updateDisplayLinkPreferredFramesPerSecond() {
@@ -346,8 +349,17 @@ open class MapView: UIView {
         eventsListener.push(event: .memoryWarning)
     }
 
-    required public init?(coder: NSCoder) {
-        super.init(coder: coder)
+    // MARK: Telemetry
+
+    private func setUpTelemetryLogging() {
+        guard let validResourceOptions = resourceOptions else { return }
+        let eventsListener = EventsManager(accessToken: validResourceOptions.accessToken)
+
+        DispatchQueue.main.async {
+            eventsListener.push(event: .map(event: .loaded))
+        }
+
+        self.eventsListener = eventsListener
     }
 }
 
@@ -361,7 +373,7 @@ extension MapView: DelegatingMapClientDelegate {
     }
 
     internal func getMetalView(for metalDevice: MTLDevice?) -> MTKView? {
-        let metalView = MTKView(frame: frame, device: metalDevice)
+        let metalView = dependencyProvider.makeMetalView(frame: frame, device: metalDevice)
         displayCallback = {
             metalView.setNeedsDisplay()
         }
@@ -380,32 +392,5 @@ extension MapView: DelegatingMapClientDelegate {
         self.metalView = metalView
 
         return metalView
-    }
-}
-
-private class BaseMapViewProxy: NSObject {
-    weak var mapView: MapView?
-
-    init(mapView: MapView) {
-        self.mapView = mapView
-        super.init()
-    }
-
-    @objc func updateFromDisplayLink(displayLink: CADisplayLink) {
-        mapView?.updateFromDisplayLink(displayLink: displayLink)
-    }
-}
-
-// MARK: Telemetry
-extension MapView {
-    internal func setUpTelemetryLogging() {
-        guard let validResourceOptions = resourceOptions else { return }
-        let eventsListener = EventsManager(accessToken: validResourceOptions.accessToken)
-
-        DispatchQueue.main.async {
-            eventsListener.push(event: .map(event: .loaded))
-        }
-
-        self.eventsListener = eventsListener
     }
 }

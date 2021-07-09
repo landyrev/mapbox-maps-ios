@@ -13,9 +13,9 @@ let package = Package(
             targets: ["MapboxMaps"]),
     ],
     dependencies: [
-        .package(name: "MapboxCoreMaps", url: "https://github.com/mapbox/mapbox-core-maps-ios.git", .exact("10.0.0-rc.2")),
+        .package(name: "MapboxCoreMaps", url: "https://github.com/mapbox/mapbox-core-maps-ios.git", .exact("10.0.0-rc.4")),
         .package(name: "MapboxMobileEvents", url: "https://github.com/mapbox/mapbox-events-ios.git", .exact("1.0.2")),
-        .package(name: "MapboxCommon", url: "https://github.com/mapbox/mapbox-common-ios.git", .exact("14.2.0")),
+        .package(name: "MapboxCommon", url: "https://github.com/mapbox/mapbox-common-ios.git", .exact("15.0.0")),
         .package(name: "Turf", url: "https://github.com/mapbox/turf-swift.git", .exact("2.0.0-beta.1")),
     ],
     targets: [
@@ -23,15 +23,15 @@ let package = Package(
             name: "MapboxMaps",
             dependencies: ["MapboxCoreMaps", "Turf", "MapboxMobileEvents", "MapboxCommon"],
             exclude: [
-                "MapView/Info.plist"
+                "Info.plist"
             ]
         ),
         .testTarget(
             name: "MapboxMapsTests",
             dependencies: ["MapboxMaps"],
             exclude: [
-                "MapView/Info.plist",
-                "MapView/Integration Tests/HTTP/HTTPIntegrationTests.swift",
+                "Info.plist",
+                "Foundation/Integration Tests/HTTP/HTTPIntegrationTests.swift",
             ],
             resources: [
                 .copy("Foundation/GeoJSON/Fixtures/point.geojson"),
